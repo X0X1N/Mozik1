@@ -1,7 +1,9 @@
 import os, sys, csv, cv2
 from typing import List, Dict
 from .core import Box, ensure_dir, expand_box, pixelate_region, gaussian_blur_region, assign_ids
-from .detect import load_haar_face, detect_faces
+from .yolo_detector import load_yolo_model, detect_faces_yolo
+from .face_embedder import FaceEmbedder
+from .face_registry import FaceRegistry
 
 # ---------- CSV I/O ----------
 def write_csv(csv_path: str, boxes: List[Box]):
@@ -38,7 +40,7 @@ def cmd_scan(args):
         print(f"[ERROR] 영상을 열 수 없음: {args.input}"); sys.exit(1)
 
     try:
-        face_cascade = load_haar_face()
+        load_yolo_model() # Ensure YOLO model is loaded
     except Exception as e:
         print(f"[ERROR] 얼굴 모델 로드 실패: {e}"); sys.exit(1)
 
@@ -50,9 +52,9 @@ def cmd_scan(args):
         ok, frame = cap.read()
         if not ok: break
         t_ms = int(cap.get(cv2.CAP_PROP_POS_MSEC))
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        # gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) # Not needed for YOLO
 
-        rects = detect_faces(gray, face_cascade, args.scale_factor, args.min_neighbors, args.min_face)
+        rects = detect_faces_yolo(frame) # Use YOLO detector
         curr_boxes = assign_ids(prev_boxes, rects, frame_idx, t_ms)
         for b in curr_boxes: b.source = "auto"
         boxes_all.extend(curr_boxes)
@@ -91,7 +93,20 @@ def cmd_render(args):
         print(f"[ERROR] 출력 비디오 생성 실패: {args.output}"); sys.exit(1)
 
     boxes_by_frame: Dict[int, List[Box]] = {}
-    face_cascade = None
+    # face_cascade = None # Removed Haar Cascade variable
+
+    # 얼굴 인식기 초기화
+    try:
+        face_embedder = FaceEmbedder()
+        face_registry = FaceRegistry(
+            db_path=args.db_path,
+            sim_threshold=args.sim_threshold,
+            unknown_policy=args.unknown_policy
+        )
+        if len(face_registry.people) > 0:
+            print(f"[OK] {len(face_registry.people)}명 얼굴 로드.")
+    except Exception as e:
+        print(f"[ERROR] 얼굴 DB 로드 실패: {e}"); sys.exit(1)
 
     if args.csv:
         if not os.path.exists(args.csv):
@@ -102,7 +117,7 @@ def cmd_render(args):
     else:
         print("[INFO] CSV 없이 자동 탐지로 렌더.")
         try:
-            face_cascade = load_haar_face()
+            load_yolo_model() # Ensure YOLO model is loaded
         except Exception as e:
             print(f"[ERROR] 얼굴 모델 로드 실패: {e}"); sys.exit(1)
 
@@ -116,18 +131,44 @@ def cmd_render(args):
                 curr = boxes_by_frame.get(frame_idx, [])
                 rects = [(b.x, b.y, b.w, b.h) for b in curr]
             else:
-                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                rects = detect_faces(gray, face_cascade, args.scale_factor, args.min_neighbors, args.min_face)
+                # gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) # Not needed for YOLO
+                rects = detect_faces_yolo(frame) # Use YOLO detector
 
-            # 모든 얼굴 처리
+            # 얼굴 인식 및 정책 기반 처리
             for (x,y,w,h) in rects:
                 x2,y2,w2,h2 = expand_box(x,y,w,h, args.pad_x, args.pad_y, frame.shape[1], frame.shape[0])
-                if args.mode == "pixelate":
-                    pixelate_region(frame, x2,y2,w2,h2, strength=args.strength)
-                else:
-                    gaussian_blur_region(frame, x2,y2,w2,h2, strength=args.strength)
+                
+                # 얼굴 영역 자르기
+                face_img = frame[y:y+h, x:x+w]
+                if face_img.size == 0: continue
+
+                # 얼굴 임베딩 및 정책 확인
+                embedding = face_embedder.get_embedding(face_img)
+                name, _ = face_registry.match(embedding)
+
+                policy = face_registry.unknown_policy
+                if name:
+                    policy = face_registry.get_policy(name)
+
+                # 정책에 따라 모자이크 처리
+                apply_mosaic = (policy == 'force')
+
+                if apply_mosaic:
+                    if args.mode == "pixelate":
+                        pixelate_region(frame, x2,y2,w2,h2, strength=args.strength)
+                    else:
+                        gaussian_blur_region(frame, x2,y2,w2,h2, strength=args.strength)
+                
                 if args.draw_box:
-                    cv2.rectangle(frame, (x2,y2), (x2+w2, y2+h2), (0,255,0), 2)
+                    # 정책에 따라 박스 색상 및 텍스트 변경
+                    color = (0, 255, 0) # green (neutral)
+                    if policy == 'force': color = (0,0,255) # red
+                    elif policy == 'exclude': color = (255,0,0) # blue
+                    
+                    cv2.rectangle(frame, (x2,y2), (x2+w2, y2+h2), color, 2)
+                    display_name = name if name else "unknown"
+                    cv2.putText(frame, display_name, (x2, y2-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
 
             out.write(frame); frame_idx += 1
 
@@ -150,9 +191,17 @@ def cmd_preview(args):
         print(f"[ERROR] 영상을 열 수 없음: {args.input}"); sys.exit(1)
 
     try:
-        face_cascade = load_haar_face()
+        load_yolo_model() # Ensure YOLO model is loaded
+        face_embedder = FaceEmbedder()
+        face_registry = FaceRegistry(
+            db_path=args.db_path,
+            sim_threshold=args.sim_threshold,
+            unknown_policy=args.unknown_policy
+        )
+        if len(face_registry.people) > 0:
+            print(f"[OK] {len(face_registry.people)}명 얼굴 로드.")
     except Exception as e:
-        print(f"[ERROR] 얼굴 모델 로드 실패: {e}"); sys.exit(1)
+        print(f"[ERROR] 얼굴 모델/DB 로드 실패: {e}"); sys.exit(1)
 
     W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)); H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
@@ -181,18 +230,39 @@ def cmd_preview(args):
             min_face = max(1, cv2.getTrackbarPos("MinFace", win))
             neighbors = max(0, cv2.getTrackbarPos("Neighbors", win))
 
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            rects = detect_faces(gray, face_cascade, args.scale_factor, neighbors, min_face)
+            # gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) # Not needed for YOLO
+            rects = detect_faces_yolo(frame) # Use YOLO detector
 
             vis = frame.copy()
             for (x,y,w,h) in rects:
                 x2,y2,w2,h2 = expand_box(x,y,w,h, pad_x, pad_y, vis.shape[1], vis.shape[0])
-                if mode_pixelate:
-                    pixelate_region(vis, x2,y2,w2,h2, strength=strength)
-                else:
-                    gaussian_blur_region(vis, x2,y2,w2,h2, strength=strength)
+                
+                face_img = frame[y:y+h, x:x+w]
+                if face_img.size == 0: continue
+
+                embedding = face_embedder.get_embedding(face_img)
+                name, _ = face_registry.match(embedding)
+                
+                policy = face_registry.unknown_policy
+                if name:
+                    policy = face_registry.get_policy(name)
+
+                apply_mosaic = (policy == 'force')
+
+                if apply_mosaic:
+                    if mode_pixelate:
+                        pixelate_region(vis, x2,y2,w2,h2, strength=strength)
+                    else:
+                        gaussian_blur_region(vis, x2,y2,w2,h2, strength=strength)
+                
                 if draw_box:
-                    cv2.rectangle(vis, (x2,y2), (x2+w2, y2+h2), (0,255,0), 2)
+                    color = (0, 255, 0) # green
+                    if policy == 'force': color = (0,0,255) # red
+                    elif policy == 'exclude': color = (255,0,0) # blue
+                    
+                    cv2.rectangle(vis, (x2,y2), (x2+w2, y2+h2), color, 2)
+                    display_name = name if name else "unknown"
+                    cv2.putText(vis, display_name, (x2, y2-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
             if recording:
                 if writer is None:
@@ -230,7 +300,6 @@ def cmd_gui(args):
         print("[ERROR] PySimpleGUI 설치 필요: pip install PySimpleGUI"); sys.exit(1)
 
     mode_pixelate = True
-    draw_box = False
     is_playing = False
     is_saving = False
 
@@ -258,9 +327,17 @@ def cmd_gui(args):
     W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)); H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
     try:
-        face_cascade = load_haar_face()
+        load_yolo_model() # Ensure YOLO model is loaded
+        face_embedder = FaceEmbedder()
+        face_registry = FaceRegistry(
+            db_path=args.db_path,
+            sim_threshold=args.sim_threshold,
+            unknown_policy=args.unknown_policy
+        )
+        if len(face_registry.people) > 0:
+            print(f"[OK] {len(face_registry.people)}명 얼굴 로드.")
     except Exception as e:
-        sg.popup_error(f"얼굴 모델 로드 실패: {e}"); window.close(); sys.exit(1)
+        sg.popup_error(f"얼굴 모델/DB 로드 실패: {e}"); window.close(); sys.exit(1)
 
     writer = None
     out_path = args.output if args.output else "gui_output.mp4"
@@ -306,18 +383,39 @@ def cmd_gui(args):
                     is_playing = False
                     window["-STATUS-"].update("상태: 끝 (정지)")
                 else:
-                    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                    rects = detect_faces(gray, face_cascade, args.scale_factor, neighbors, min_face)
+                    # gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) # Not needed for YOLO
+                    rects = detect_faces_yolo(frame) # Use YOLO detector
 
                     vis = frame.copy()
                     for (x,y,w,h) in rects:
                         x2,y2,w2,h2 = expand_box(x,y,w,h, pad_x, pad_y, vis.shape[1], vis.shape[0])
-                        if mode_pixelate:
-                            pixelate_region(vis, x2,y2,w2,h2, strength=strength)
-                        else:
-                            gaussian_blur_region(vis, x2,y2,w2,h2, strength=strength)
+                        
+                        face_img = frame[y:y+h, x:x+w]
+                        if face_img.size == 0: continue
+
+                        embedding = face_embedder.get_embedding(face_img)
+                        name, _ = face_registry.match(embedding)
+
+                        policy = face_registry.unknown_policy
+                        if name:
+                            policy = face_registry.get_policy(name)
+
+                        apply_mosaic = (policy == 'force')
+
+                        if apply_mosaic:
+                            if mode_pixelate:
+                                pixelate_region(vis, x2,y2,w2,h2, strength=strength)
+                            else:
+                                gaussian_blur_region(vis, x2,y2,w2,h2, strength=strength)
+                        
                         if draw_box:
-                            cv2.rectangle(vis, (x2,y2), (x2+w2, y2+h2), (0,255,0), 2)
+                            color = (0, 255, 0) # green
+                            if policy == 'force': color = (0,0,255) # red
+                            elif policy == 'exclude': color = (255,0,0) # blue
+                            
+                            cv2.rectangle(vis, (x2,y2), (x2+w2, y2+h2), color, 2)
+                            display_name = name if name else "unknown"
+                            cv2.putText(vis, display_name, (x2, y2-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
                     if is_saving and writer is not None:
                         writer.write(vis)

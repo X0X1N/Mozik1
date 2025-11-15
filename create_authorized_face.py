@@ -2,14 +2,8 @@
 import os
 import cv2
 import time
-
-# -----------------------------------
-# 기본 설정
-# -----------------------------------
-SAVE_DIR = "detected_face"   # 여러 사람의 얼굴 이미지를 저장하는 폴더
-
-if not os.path.exists(SAVE_DIR):
-    os.makedirs(SAVE_DIR)
+from .face_embedder import get_embedding
+from .face_registry import FaceRegistry
 
 # -----------------------------------
 # 유틸 함수
@@ -71,29 +65,27 @@ def padded_crop(frame, box, pad_ratio=0.25):
 
     return frame[new_y:new_y+new_h, new_x:new_x+new_w], (new_x, new_y, new_w, new_h)
 
+def _prompt_and_set_policy(face_registry: FaceRegistry, person_name: str):
+    """Helper to prompt for and set the mosaic policy for a person."""
+    while True:
+        policy = input(f"[INPUT] '{person_name}'의 모자이크 정책을 선택하라 (force/exclude/neutral): ").strip().lower()
+        if policy in ["force", "exclude", "neutral"]:
+            face_registry.set_policy(person_name, policy)
+            print(f"[SUCCESS] '{person_name}'의 정책을 '{policy}'(으)로 설정했다.")
+            break
+        else:
+            print("[ERROR] 잘못된 입력이다. 'force', 'exclude', 'neutral' 중 하나를 입력하라.")
+
 # -----------------------------------
-# 메인 로직
+# 메인 로직: 웹캠
 # -----------------------------------
-def capture_and_save_faces_multi():
+def capture_and_save_faces_multi(face_cascade, face_registry: FaceRegistry):
     print("[INFO] 얼굴 등록을 시작한다. 's'=저장, 'n'=이름변경, 'q'=종료이다.")
 
     # 카메라 열기(여러 인덱스/백엔드 폴백)
     cap, cam_idx, backend_name = try_open_camera()
     if cap is None:
         print("[ERROR] 웹캠을 열 수 없다. 다른 앱 점유/권한/드라이버 상태를 확인하라.")
-        return
-
-    # Haar 로드
-    haar_path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
-    if not os.path.exists(haar_path):
-        print(f"[ERROR] haarcascade 파일을 찾을 수 없다: {haar_path}")
-        cap.release()
-        return
-
-    face_cascade = cv2.CascadeClassifier(haar_path)
-    if face_cascade.empty():
-        print("[ERROR] Haar Cascade 로드를 실패했다.")
-        cap.release()
         return
 
     # 최초 등록자 이름 입력
@@ -147,21 +139,109 @@ def capture_and_save_faces_multi():
                 print("[WARNING] 저장할 얼굴이 탐지되지 않았다. 다시 시도하라.")
                 continue
 
-       
-            cropped, padded_box = padded_crop(frame, largest, pad_ratio=0.25)
+            # 얼굴 크롭 및 임베딩 생성
+            cropped, _ = padded_crop(frame, largest)
+            embedding = get_embedding(cropped)
+            if embedding is None:
+                print("[ERROR] 얼굴 임베딩 생성 실패. 다른 각도/조명으로 시도하라.")
+                continue
 
-    
-            ts = time.strftime("%Y%m%d_%H%M%S")
-            save_path = os.path.join(SAVE_DIR, f"{person_name}_{ts}.jpg")
-            cv2.imwrite(save_path, cropped)
-            print(f"[SUCCESS] '{person_name}' 얼굴을 '{save_path}'에 저장했다.")
+            # DB에 저장
+            face_registry.add(person_name, embedding)
+            print(f"[SUCCESS] '{person_name}'의 얼굴 임베딩을 DB에 저장했다.")
 
-            
+            # 정책 설정
+            _prompt_and_set_policy(face_registry, person_name)
 
     cap.release()
     cv2.destroyAllWindows()
     print("[INFO] 등록을 종료한다.")
 
+# -----------------------------------
+# 메인 로직: 이미지 파일
+# -----------------------------------
+def register_from_image(face_cascade, face_registry: FaceRegistry):
+    print("[INFO] 이미지 파일로 얼굴 등록을 시작한다.")
+    
+    while True:
+        image_path = input("[INPUT] 얼굴을 등록할 이미지 파일 경로를 입력하세요 (종료하려면 'q' 입력): ").strip()
+        if image_path.lower() == 'q':
+            break
+        
+        if not os.path.exists(image_path):
+            print(f"[ERROR] 파일을 찾을 수 없습니다: {image_path}")
+            continue
+
+        person_name = input("[INPUT] 등록할 사람의 이름을 입력하세요: ").strip()
+        if not person_name:
+            print("[ERROR] 이름이 비어있습니다. 다시 시도하세요.")
+            continue
+
+        frame = cv2.imread(image_path)
+        if frame is None:
+            print(f"[ERROR] 이미지를 읽을 수 없습니다: {image_path}")
+            continue
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(60, 60))
+        largest = pick_largest_face(faces)
+
+        if largest is None:
+            print("[ERROR] 이미지에서 얼굴을 탐지하지 못했습니다.")
+            continue
+
+        # 얼굴 크롭 및 임베딩 생성
+        cropped, _ = padded_crop(frame, largest)
+        embedding = get_embedding(cropped)
+        if embedding is None:
+            print("[ERROR] 얼굴 임베딩 생성 실패. 다른 이미지로 시도하세요.")
+            continue
+
+        # DB에 저장
+        face_registry.add(person_name, embedding)
+        print(f"[SUCCESS] '{person_name}'의 얼굴 임베딩을 DB에 저장했습니다.")
+
+        # 정책 설정
+        _prompt_and_set_policy(face_registry, person_name)
+
+    print("[INFO] 이미지 등록을 종료합니다.")
+
+
+def main():
+    # Haar 로드
+    haar_path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+    if not os.path.exists(haar_path):
+        print(f"[ERROR] haarcascade 파일을 찾을 수 없다: {haar_path}")
+        return
+
+    face_cascade = cv2.CascadeClassifier(haar_path)
+    if face_cascade.empty():
+        print("[ERROR] Haar Cascade 로드를 실패했다.")
+        return
+
+    # 얼굴 인식 모듈 로드
+    try:
+        face_registry = FaceRegistry()
+        print("[INFO] 얼굴 임베딩 모델 및 DB 로드 완료.")
+    except Exception as e:
+        print(f"[ERROR] 얼굴 인식 모듈 로드 실패: {e}")
+        return
+
+    while True:
+        print("\n얼굴 등록 방식을 선택하세요:")
+        print("1: 웹캠으로 등록")
+        print("2: 이미지 파일로 등록")
+        print("q: 종료")
+        choice = input("선택: ").strip().lower()
+
+        if choice == '1':
+            capture_and_save_faces_multi(face_cascade, face_registry)
+        elif choice == '2':
+            register_from_image(face_cascade, face_registry)
+        elif choice == 'q':
+            break
+        else:
+            print("[ERROR] 잘못된 선택입니다. 1, 2, q 중에서 선택하세요.")
 
 if __name__ == '__main__':
-    capture_and_save_faces_multi()
+    main()

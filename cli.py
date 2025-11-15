@@ -20,6 +20,11 @@ def build_parser():
         sp.add_argument("--preview", action="store_true")
         sp.add_argument("--preview-stride", type=int, default=15)
 
+    def add_face_recognition_opts(sp):
+        sp.add_argument("--db-path", default="face_db", help="얼굴 DB 경로")
+        sp.add_argument("--sim-threshold", type=float, default=0.82, help="얼굴 유사도 문턱값 (낮을수록 엄격)")
+        sp.add_argument("--unknown-policy", choices=["force", "exclude"], default="force", help="미등록 얼굴 정책")
+
     s = sub.add_parser("scan", help="얼굴 자동 탐지 후 CSV로 내보내기")
     s.add_argument("-i","--input", required=True)
     s.add_argument("-o","--output-csv", default="faces_auto.csv")
@@ -33,6 +38,7 @@ def build_parser():
     r.add_argument("--strength", type=int, default=18)
     r.add_argument("--draw-box", action="store_true")
     add_common_opts(r)
+    add_face_recognition_opts(r)
 
     pvw = sub.add_parser("preview", help="실시간 프리뷰(키보드/슬라이더, r=저장)")
     pvw.add_argument("-i","--input", required=True)
@@ -42,6 +48,7 @@ def build_parser():
     pvw.add_argument("--min-face", type=int, default=24)
     pvw.add_argument("--pad-x", type=float, default=0.15)
     pvw.add_argument("--pad-y", type=float, default=0.20)
+    add_face_recognition_opts(pvw)
 
     # ⬇ 중복된 sub.add_parser("gui") 제거하고 하나만 둠
     gui = sub.add_parser("gui", help="GUI(재생/일시정지/저장/종료 버튼)")
@@ -52,6 +59,7 @@ def build_parser():
     gui.add_argument("--min-face", type=int, default=24)
     gui.add_argument("--pad-x", type=float, default=0.15)
     gui.add_argument("--pad-y", type=float, default=0.20)
+    add_face_recognition_opts(gui)
 
     studio = sub.add_parser("studio", help="Tk 인터랙티브 스튜디오(업로드→구간선택→얼굴선택→수동박스→내보내기)")
     # ⬇ 어떤 스튜디오를 띄울지 선택할 수 있게 옵션 추가
